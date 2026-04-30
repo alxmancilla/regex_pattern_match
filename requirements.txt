@@ -1,2 +1,4 @@
 pymongo>=4.9
 python-dotenv>=1.0
+numpy>=2.4
+locust>=2.20

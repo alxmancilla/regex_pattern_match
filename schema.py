@@ -1,10 +1,10 @@
-"""schema.py — Shared Atlas Search index definition and index-wait utility.
+"""schema.py — Shared Atlas Search / Vector Search index definitions and utilities.
 
 Imported by both main.py and perf_test.py so the schema is defined exactly
 once.  Any change to the index mapping only needs updating here.
 
-Index design summary
-────────────────────
+Text search index (SEARCH_INDEX_DEFINITION)
+────────────────────────────────────────────
   content        lucene.keyword   Full field value as one token → regex can
                                   match across the entire string.
     .multi.std   lucene.standard  Word-tokenised → inverted-index term lookup
@@ -20,6 +20,15 @@ Index design summary
                                   (mongot).  Combined with returnStoredSource:true
                                   in queries, this skips the per-hit round-trip
                                   from mongot back to mongod.
+                                  NOTE: embeddings is intentionally excluded —
+                                  storing 1536 floats per doc in mongot would
+                                  waste memory with no query benefit.
+
+Vector search index (VECTOR_INDEX_DEFINITION)
+──────────────────────────────────────────────
+  embeddings     knnVector / cosine   1536-dimensional embedding vector.
+                                      Separate vectorSearch index required by
+                                      Atlas — cannot share the text search index.
 """
 
 import time
@@ -55,9 +64,30 @@ SEARCH_INDEX_DEFINITION: dict = {
     # storedSource keeps these fields inside the Lucene index (mongot).
     # Set returnStoredSource:true in queries to serve docs directly from
     # mongot, avoiding a separate round-trip to mongod per matching document.
+    # embeddings is intentionally excluded: 1536 floats per doc would bloat
+    # the mongot in-memory index with no benefit for text/regex queries.
     "storedSource": {
         "include": ["filename", "content", "content_lc", "metadata"],
     },
+}
+
+# ---------------------------------------------------------------------------
+# Vector search index  (separate index type required by Atlas)
+# ---------------------------------------------------------------------------
+
+VECTOR_INDEX_NAME = "embeddings_vector"
+
+VECTOR_INDEX_DEFINITION: dict = {
+    "fields": [
+        {
+            "type":          "vector",
+            "path":          "embeddings",
+            "numDimensions": 1536,
+            # cosine similarity — standard for text embeddings (e.g. OpenAI ada-002).
+            # Use "euclidean" for geometric distance or "dotProduct" for pre-normalised vecs.
+            "similarity":    "cosine",
+        }
+    ],
 }
 
 
@@ -120,6 +150,41 @@ def wait_for_index(collection, index_name: str, max_wait: int = 600) -> bool:
                 # OperationFailure (INITIAL_SYNC) or any other transient error.
                 pass
         elif status in _TERMINAL_FAIL:
+            print(f" FAILED (status={status})!")
+            return False
+        print(".", end="", flush=True)
+        time.sleep(5)
+    print(" timed out!")
+    return False
+
+
+def wait_for_vector_index(collection, index_name: str, max_wait: int = 600) -> bool:
+    """Poll until the named Atlas Vector Search index reaches READY status.
+
+    Vector search indexes use a different index type ("vectorSearch") than text
+    search indexes ("search").  list_search_indexes() returns both types, so the
+    same polling approach works.  A query probe is not used here because running
+    a $vectorSearch requires a full-dimensional query vector, which is the
+    caller's concern; status-READY is a reliable-enough signal for vector indexes
+    whose build lifecycle does not exhibit the false-READY / INITIAL_SYNC race
+    seen in text indexes.
+
+    Prints one dot per 5-second tick.  Returns True on READY, False on timeout
+    or terminal failure (FAILED, STALE).
+    """
+    _TERMINAL_FAIL = {"FAILED", "STALE", "DOES_NOT_EXIST"}
+    print(f"  Waiting for vector index '{index_name}'", end="", flush=True)
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        status = None
+        for idx in collection.list_search_indexes():
+            if idx["name"] == index_name:
+                status = idx["status"]
+                break
+        if status == "READY":
+            print(" ready!")
+            return True
+        if status in _TERMINAL_FAIL:
             print(f" FAILED (status={status})!")
             return False
         print(".", end="", flush=True)

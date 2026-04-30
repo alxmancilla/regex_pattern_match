@@ -1,8 +1,10 @@
 """
 Performance Test: Plain $regex vs Atlas Search $search / regex operator
 
-Generates a synthetic dataset, then benchmarks both approaches across
-several pattern types and reports avg / median / min / max / stdev latency.
+Sequential benchmark that reports avg / median / min / max / stdev latency.
+For P95 / P99 and concurrent load use the Locust files instead:
+    locust -f locustfile_regex.py    # MQL $regex load test
+    locust -f locustfile_search.py   # Atlas Search load test
 
 Benchmark configuration (matches reference profile):
     Documents        100,000   --docs 100000  (default)
@@ -15,24 +17,22 @@ Benchmark configuration (matches reference profile):
 Usage:
     python perf_test.py
     python perf_test.py --docs 100000 --runs 60 --warmup 15 --queries-per-iter 5
-    python perf_test.py --reuse                # skip data rebuild
-    python perf_test.py --limit 0             # fetch all hits
+    python perf_test.py --reuse   # skip data rebuild if indexes are READY
+    python perf_test.py --limit 0 # fetch all hits (selective scenarios)
 """
 
-import os
-import re
 import sys
-import time
-import random
 import argparse
 from statistics import mean, median, stdev
 from typing import NamedTuple
-from dotenv import load_dotenv
 from pymongo import MongoClient
-from pymongo.operations import SearchIndexModel
-from schema import SEARCH_INDEX_DEFINITION, wait_for_index
 
-load_dotenv()
+from perf_common import (
+    MONGODB_URI, DATABASE_NAME, SEARCH_INDEX_NAME,
+    setup_perf_collection,
+    run_mql_regex, run_atlas_search_regex, run_compound_search_regex,
+    run_atlas_text, run_mql_negation, run_atlas_negation,
+)
 
 # =============================================================================
 # Typed scenario definitions
@@ -58,235 +58,9 @@ class NegationScenario(NamedTuple):
     fetch_limit:   int | None = None  # None=use CLI --limit; 0=fetch all
 
 
-# =============================================================================
-# Configuration  (shared with main.py via .env)
-# =============================================================================
-
-MONGODB_URI       = os.getenv("MONGODB_URI", "mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/")
-DATABASE_NAME     = os.getenv("DATABASE_NAME", "regex_demo")
-PERF_COLLECTION   = "perf_documents"          # separate from the demo collection
-SEARCH_INDEX_NAME = os.getenv("SEARCH_INDEX_NAME", "content_search")
-
-# SEARCH_INDEX_DEFINITION and wait_for_index are imported from schema.py.
-# See schema.py for the full definition and design rationale.
-# Both main.py and perf_test.py share the same definition to prevent drift.
-
-# =============================================================================
-# Synthetic document generation
-# =============================================================================
-
-_SERVERS    = ["prod-db-01", "prod-api-02", "auth-service", "cache-01", "worker-03"]
-_USERS      = ["admin", "john", "jane", "deploy", "monitor"]
-_LEVELS     = ["INFO", "WARN", "ERROR"]
-_EMAILS     = ["alice@example.com", "Bob@Test.org", "Carol@CORP.net", "dave@Service.io"]
-_IP_TMPLS   = ["192.168.1.{}", "10.0.0.{}", "172.16.0.{}"]
-_PORTS      = [5432, 6379, 8080, 27017, 3306]
-_EXCEPTIONS = [
-    "NullPointerException", "IllegalArgumentException",
-    "RuntimeException", "IOException", "TimeoutException",
-]
 
 
-def _rand_date() -> str:
-    return (f"2024-{random.randint(1,12):02d}-{random.randint(1,28):02d} "
-            f"{random.randint(0,23):02d}:{random.randint(0,59):02d}:{random.randint(0,59):02d}")
 
-
-def _rand_ip() -> str:
-    return random.choice(_IP_TMPLS).format(random.randint(1, 254))
-
-
-def _make_log() -> str:
-    lines = [f"{random.choice(_LEVELS)} {_rand_date()} {random.choice(_USERS)} on {random.choice(_SERVERS)}"
-             for _ in range(random.randint(2, 5))]
-    return "\n".join(lines)
-
-
-def _make_config() -> str:
-    port = random.choice(_PORTS)
-    return (f'{{"database": {{"host": "localhost", "port": {port}, '
-            f'"username": "{random.choice(_USERS)}"}}, '
-            f'"cache": {{"enabled": true, "ttl": {random.randint(300, 7200)}}}}}')
-
-
-def _make_api_response() -> str:
-    emails = random.sample(_EMAILS, k=random.randint(1, 3))
-    users  = ", ".join(f'{{"id": {i+1}, "email": "{e}"}}' for i, e in enumerate(emails))
-    return f'{{"status": "success", "data": {{"users": [{users}]}}}}'
-
-
-def _make_access_log() -> str:
-    lines = [f"INFO {_rand_date()} User {random.choice(_USERS)} logged in from {_rand_ip()}"
-             for _ in range(random.randint(2, 4))]
-    if random.random() < 0.35:
-        lines.append(f"WARN {_rand_date()} Failed login attempt for user unknown")
-    return "\n".join(lines)
-
-
-def _make_stack_trace() -> str:
-    e1, e2 = random.choice(_EXCEPTIONS), random.choice(_EXCEPTIONS)
-    return (f"Stack trace: {e1} at com.app.Service.process(Service.java:{random.randint(10,200)})\n"
-            f"Caused by: {e2} at com.app.Validator.check(Validator.java:{random.randint(10,200)})")
-
-
-_MAKERS = [_make_log, _make_config, _make_api_response, _make_access_log, _make_stack_trace]
-
-# ---------------------------------------------------------------------------
-# Rare document generators — each appears in ~2% of the corpus.
-# Their distinguishing tokens ("CRIT", "AUDIT", "DEPLOY") are absent from the
-# common document types above, so the Atlas Search text pre-filter is highly
-# selective: it narrows 100K candidates down to ~2K before regex is applied.
-# ---------------------------------------------------------------------------
-
-# Deterministic codes — using random.sample() at module level would produce a
-# different set on each interpreter start, so the compound text pre-filter
-# query ("CRIT") would no longer match the exact tokens in the corpus.
-_CRIT_CODES  = [f"CRIT-{n:04d}" for n in range(1000, 1050)]
-_OPS         = ["DELETE", "UPDATE", "CREATE", "READ"]
-_SERVICES    = ["svc-api", "svc-auth", "svc-billing", "svc-gateway", "svc-worker"]
-_REGIONS     = ["us-east-1", "eu-west-1", "ap-southeast-1", "us-west-2"]
-_ENVS        = ["production", "staging", "qa"]
-
-
-def _make_critical_alert() -> str:
-    """Contains token CRIT-NNNN — unique to ~2% of corpus."""
-    code = random.choice(_CRIT_CODES)
-    host = random.choice(_SERVERS)
-    pct  = random.randint(80, 99)
-    return (f"{code} {_rand_date()} severity=critical host={host} "
-            f"msg=\"disk usage threshold exceeded {pct}%\" pid={random.randint(1000,9999)}")
-
-
-def _make_audit_event() -> str:
-    """Contains token AUDIT-EVENT — unique to ~2% of corpus."""
-    uid = random.randint(1000, 9999)
-    op  = random.choice(_OPS)
-    svc = random.choice(_SERVICES)
-    return (f"AUDIT-EVENT {_rand_date()} uid={uid} op={op} "
-            f"resource=/api/users/{random.randint(1,999)} svc={svc} ip={_rand_ip()}")
-
-
-def _make_deploy_record() -> str:
-    """Contains token DEPLOY — unique to ~2% of corpus."""
-    svc    = random.choice(_SERVICES)
-    major  = random.randint(1, 5)
-    minor  = random.randint(0, 12)
-    patch  = random.randint(0, 20)
-    commit = "".join(random.choices("abcdef0123456789", k=8))
-    return (f"DEPLOY {svc} v{major}.{minor}.{patch} env={random.choice(_ENVS)} "
-            f"region={random.choice(_REGIONS)} commit={commit} "
-            f"triggered_by={random.choice(_USERS)} ts={_rand_date()}")
-
-
-_RARE_MAKERS = [_make_critical_alert, _make_audit_event, _make_deploy_record]
-
-
-def generate_documents(n: int) -> list:
-    """Return n synthetic documents with varied, realistic content.
-
-    ~0.6% of documents use each rare generator (_RARE_MAKERS), giving the
-    Atlas Search compound text pre-filter genuine selectivity:
-        100K docs → ~600 CRIT docs, ~600 AUDIT docs, ~600 DEPLOY docs.
-    This matches the "Entity Records 600" target of the reference benchmark.
-
-    content_lc is a pre-lowercased copy of content, indexed with lucene.keyword.
-    (?i) inline flags are not supported by Atlas Search regex; multi-field paths
-    (content.lc) are also unreliable — storing a separate lowercased field is
-    the correct approach.
-    """
-    random.seed(42)          # reproducible dataset
-    docs = []
-    for i in range(n):
-        # Every 167th document (positions 0, 1, 2 of every 167-slot window)
-        # cycles through rare types.  That gives 3/167 ≈ 1.8% rare docs total,
-        # 0.6% each type → ~600 CRIT, ~600 AUDIT, ~600 DEPLOY per 100K docs.
-        # This matches the "Entity Records 600" target of the reference benchmark.
-        # At this density the text pre-filter is highly selective: the inverted-
-        # index lookup reduces 100K candidates to ~600 before regex is applied,
-        # and the result set is small enough that mongot scoring overhead doesn't
-        # overwhelm the gain from skipping the full BSON collection scan.
-        if i % 167 < len(_RARE_MAKERS):
-            content = _RARE_MAKERS[i % 167]()
-        else:
-            content = _MAKERS[i % len(_MAKERS)]()
-        docs.append({
-            "_id":        i + 1,
-            "filename":   f"doc_{i+1:05d}.txt",
-            "content":    content,
-            "content_lc": content.lower(),
-            "metadata":   {"seq": i + 1},
-        })
-    return docs
-
-
-# =============================================================================
-# Collection / index setup
-# =============================================================================
-
-# _wait_for_index is imported from schema.py as wait_for_index.
-# Both main.py and perf_test.py share the same polling logic.
-
-def _index_status(collection) -> str | None:
-    """Return the status string of the search index, or None if it doesn't exist."""
-    for idx in collection.list_search_indexes():
-        if idx["name"] == SEARCH_INDEX_NAME:
-            return idx["status"]
-    return None
-
-
-def setup_perf_collection(client: MongoClient, num_docs: int, reuse: bool = False):
-    """Drop, populate, and index the perf collection. Returns the collection.
-
-    If reuse=True and the collection already has documents with the index READY,
-    skip the expensive drop/insert/index cycle entirely.
-
-    If the index already exists (BUILDING or READY) from a previous interrupted run
-    on a freshly populated collection, we wait for it rather than recreating it.
-    """
-    db         = client[DATABASE_NAME]
-    collection = db[PERF_COLLECTION]
-
-    existing = collection.estimated_document_count()
-    status   = _index_status(collection)
-
-    # Fast path: --reuse with everything already good
-    if reuse and existing > 0 and status == "READY":
-        print(f"\nReusing existing collection ({existing:,} docs) and READY index.")
-        return collection, existing
-
-    # If the collection already has the right number of docs and the index is
-    # in-progress (BUILDING / PENDING / INITIAL_SYNC), just wait — don't drop.
-    if existing == num_docs and status in ("BUILDING", "PENDING", "INITIAL_SYNC"):
-        print(f"\nCollection has {existing:,} docs; index is {status} — waiting...")
-        if not wait_for_index(collection, SEARCH_INDEX_NAME):
-            sys.exit("Index did not reach READY state — aborting benchmark.")
-        return collection, existing
-
-    # Full rebuild
-    print(f"\nGenerating {num_docs:,} synthetic documents...")
-    docs = generate_documents(num_docs)
-
-    # collection.drop() also deletes all search indexes automatically.
-    # Do NOT call drop_search_index() afterwards — the index is already gone.
-    collection.drop()
-
-    # Batch insert: sending all docs in a single call can exceed BSON limits
-    # (16 MB per message) for large datasets.  1 000-doc batches keep each
-    # network round-trip well under the limit and show progress for long runs.
-    _BATCH = 1_000
-    for start in range(0, num_docs, _BATCH):
-        collection.insert_many(docs[start:start + _BATCH], ordered=False)
-        if (start + _BATCH) % 10_000 == 0 or start + _BATCH >= num_docs:
-            print(f"  Inserted {min(start + _BATCH, num_docs):,} / {num_docs:,} documents...")
-    print(f"  Done — {num_docs:,} documents in '{PERF_COLLECTION}'")
-
-    collection.create_search_index(
-        SearchIndexModel(definition=SEARCH_INDEX_DEFINITION, name=SEARCH_INDEX_NAME)
-    )
-    print("  Index submitted — waiting for Atlas to build it (typically 60-180 s for 100K docs)...")
-    if not wait_for_index(collection, SEARCH_INDEX_NAME):
-        sys.exit("Index did not reach READY state — aborting benchmark.")
-    return collection, num_docs
 
 
 # =============================================================================
@@ -304,186 +78,6 @@ def _stats(times: list[float]) -> dict:
     }
 
 
-# =============================================================================
-# Query runners
-# =============================================================================
-
-def run_mql_regex(collection, pattern: str, options: str = "", limit: int = 0) -> tuple:
-    """
-    Plain MQL $regex — always a collection scan (no text index).
-    Returns (result_count, elapsed_ms).
-    """
-    query  = {"content": {"$regex": pattern}}
-    if options:
-        query["content"]["$options"] = options
-    t0     = time.perf_counter()
-    cursor = collection.find(query, {"_id": 1})
-    if limit:
-        cursor = cursor.limit(limit)
-    count = len(list(cursor))
-    return count, (time.perf_counter() - t0) * 1000
-
-
-def run_atlas_search_regex(collection, pattern: str,
-                           path: str = "content", limit: int = 0) -> tuple:
-    """
-    Atlas Search $search / regex operator — uses the Lucene index.
-    path       : indexed field path.
-                 "content"    → case-sensitive  (lucene.keyword, original case)
-                 "content_lc" → case-insensitive (lucene.keyword, pre-lowercased)
-    limit      : if > 0, add a $limit stage to simulate paginated queries.
-    concurrent : parallelizes Lucene segment scan on dedicated search nodes (S20+).
-    returnStoredSource skips the mongot→mongod document-lookup round-trip.
-    Returns (result_count, elapsed_ms).
-    """
-    pipeline = [
-        {
-            "$search": {
-                "index": SEARCH_INDEX_NAME,
-                "regex": {"path": path, "query": pattern},
-                "concurrent": True,           # parallelize across Lucene segments (S20+)
-                "returnStoredSource": True,   # serve fields from Lucene, not mongod
-            }
-        },
-    ]
-    if limit:
-        pipeline.append({"$limit": limit})
-    pipeline.append({"$project": {"_id": 1}})
-    t0    = time.perf_counter()
-    count = len(list(collection.aggregate(pipeline)))
-    return count, (time.perf_counter() - t0) * 1000
-
-
-def run_compound_search_regex(collection, text_query: str, pattern: str,
-                               path: str = "content", limit: int = 0) -> tuple:
-    """
-    Compound Atlas Search: text pre-filter (inverted index) + regex refinement.
-
-    This is the *correct* way to use $search regex. The compound pattern:
-      1. filter[text]  — O(matching) term lookup via inverted index (lucene.standard).
-                         Narrows 100K docs down to a small candidate set.
-      2. must[regex]   — O(candidates) regex applied only to the filtered subset.
-
-    Combined this beats $regex (MQL) when the text pre-filter is selective enough.
-
-    text_query : term(s) passed to the text operator (targets content multi-field "std",
-                 referenced as {"value": "content", "multi": "std"} in the query).
-    pattern    : Lucene regex applied for refinement.
-    path       : field for the regex clause (lucene.keyword).
-    limit      : if > 0, add a $limit stage.
-    Returns (result_count, elapsed_ms).
-    """
-    pipeline = [
-        {
-            "$search": {
-                "index": SEARCH_INDEX_NAME,
-                "compound": {
-                    # filter doesn't affect scoring — best for mandatory pre-filters.
-                    # Multi-analyzer fields are referenced with {"value": field, "multi": name}
-                    # NOT as "field.multiName" — the dot-notation is NOT valid for text queries.
-                    "filter": [
-                        {
-                            "text": {
-                                "path": {"value": "content", "multi": "std"},
-                                "query": text_query,
-                            }
-                        }
-                    ],
-                    # must affects scoring — regex refines the candidate set
-                    "must": [
-                        {"regex": {"path": path, "query": pattern}}
-                    ],
-                },
-                "concurrent": True,
-                "returnStoredSource": True,
-            }
-        },
-    ]
-    if limit:
-        pipeline.append({"$limit": limit})
-    pipeline.append({"$project": {"_id": 1}})
-    t0    = time.perf_counter()
-    count = len(list(collection.aggregate(pipeline)))
-    return count, (time.perf_counter() - t0) * 1000
-
-
-def run_atlas_text(collection, query: str, limit: int = 0) -> tuple:
-    """
-    Atlas Search text operator — inverted-index keyword lookup on content.std.
-    O(matching docs) — only scans the relevant inverted-index entries.
-    Requires the lucene.standard multi-field ("std") on the content field.
-    Returns (result_count, elapsed_ms).
-    """
-    pipeline = [
-        {
-            "$search": {
-                "index": SEARCH_INDEX_NAME,
-                "text": {
-                    # Multi-analyzer field syntax — NOT "content.std" dot notation.
-                    "path": {"value": "content", "multi": "std"},
-                    "query": query,
-                },
-                "concurrent": True,
-                "returnStoredSource": True,
-            }
-        },
-    ]
-    if limit:
-        pipeline.append({"$limit": limit})
-    pipeline.append({"$project": {"_id": 1}})
-    t0    = time.perf_counter()
-    count = len(list(collection.aggregate(pipeline)))
-    return count, (time.perf_counter() - t0) * 1000
-
-
-def run_mql_negation(collection, pattern: str, limit: int = 0) -> tuple:
-    """
-    MQL $not $regex — collection scan that excludes documents matching pattern.
-    Returns (result_count, elapsed_ms).
-    """
-    t0     = time.perf_counter()
-    cursor = collection.find({"content": {"$not": {"$regex": pattern}}}, {"_id": 1})
-    if limit:
-        cursor = cursor.limit(limit)
-    count = len(list(cursor))
-    return count, (time.perf_counter() - t0) * 1000
-
-
-def run_atlas_negation(collection, pattern: str, limit: int = 0) -> tuple:
-    """
-    Atlas Search compound: filter (match all) + mustNot (exclude regex matches).
-    No inverted-index benefit for negation — O(N) like MQL but with IPC overhead.
-    Returns (result_count, elapsed_ms).
-    """
-    pipeline = [
-        {
-            "$search": {
-                "index": SEARCH_INDEX_NAME,
-                "compound": {
-                    "filter": [
-                        {"wildcard": {"path": "content", "query": "*",
-                                      "allowAnalyzedField": True}}
-                    ],
-                    "mustNot": [
-                        {"regex": {"path": "content", "query": pattern}}
-                    ],
-                },
-                "concurrent": True,
-                "returnStoredSource": True,
-            }
-        },
-    ]
-    if limit:
-        pipeline.append({"$limit": limit})
-    pipeline.append({"$project": {"_id": 1}})
-    t0    = time.perf_counter()
-    count = len(list(collection.aggregate(pipeline)))
-    return count, (time.perf_counter() - t0) * 1000
-
-
-# =============================================================================
-# Benchmark engine
-# =============================================================================
 
 def benchmark(collection, label: str,
               mql_pattern: str, atlas_pattern: str,
